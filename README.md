@@ -1,0 +1,1 @@
+# Painel-de-Escala-_-Gest-o-Integrada
