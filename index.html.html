@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestor de Escalas de Monitoramento</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .contact-badge {
+            background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+            color: white;
+            box-shadow: 0 2px 4px rgba(37, 99, 235, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+
+        // --- Icons ---
+        const IconUser = () => <i className="ph ph-user"></i>;
+        const IconShield = () => <i className="ph ph-shield-check"></i>; 
+        const IconBriefcase = () => <i className="ph ph-briefcase"></i>; 
+        const IconUsers = () => <i className="ph ph-users"></i>;
+        const IconCalendar = () => <i className="ph ph-calendar-blank"></i>;
+        const IconSettings = () => <i className="ph ph-gear"></i>;
+        const IconTrash = () => <i className="ph ph-trash"></i>;
+        const IconEdit = () => <i className="ph ph-pencil-simple"></i>;
+        const IconPlus = () => <i className="ph ph-plus"></i>;
+        const IconDownload = () => <i className="ph ph-download-simple"></i>;
+        const IconUpload = () => <i className="ph ph-upload-simple"></i>;
+        const IconX = () => <i className="ph ph-x"></i>;
+        const IconPaint = () => <i className="ph ph-paint-bucket"></i>;
+        const IconClock = () => <i className="ph ph-clock"></i>;
+        const IconList = () => <i className="ph ph-list-dashes"></i>;
+        const IconPhone = () => <i className="ph ph-phone"></i>;
+        const IconWarning = () => <i className="ph ph-warning-circle"></i>;
+
+        const DynamicIcon = ({ name, className }) => <i className={`ph ${name} ${className}`}></i>;
+
+        // --- Helpers ---
+        const uuid = () => Math.random().toString(36).substr(2, 9);
+        const addDays = (date, days) => { const r = new Date(date); r.setDate(r.getDate() + days); return r; };
+        const formatDate = (date) => date.toISOString().split('T')[0];
+        const parseDate = (dateStr) => new Date(dateStr + 'T00:00:00');
+        const mod = (n, m) => ((n % m) + m) % m;
+
+        const getDayName = (dateStr) => {
+            const days = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
+            return days[parseDate(dateStr).getDay()];
+        };
+
+        const isShiftActiveNow = (dateStr, startTime, durationHours) => {
+            if (!startTime || dateStr !== formatDate(new Date())) return false;
+            try {
+                const now = new Date();
+                const [h, m] = startTime.split(':').map(Number);
+                const start = new Date(now); start.setHours(h, m, 0, 0);
+                const end = new Date(start); end.setHours(start.getHours() + (durationHours || 12));
+                return now >= start && now <= end;
+            } catch(e) { return false; }
+        };
+
+        const getAutoColor = (label) => {
+            if (!label) return '#94a3b8';
+            const l = label.toLowerCase();
+            if (l.includes('diurno') || l.includes('amarelo') || l.includes('m1') || l.includes('m2') || l.includes('turma c')) return '#F59E0B';
+            if (l.includes('noturno') || l.includes('azul') || l.includes('t1') || l.includes('t2') || l.includes('turma b')) return '#3B82F6';
+            if (l.includes('vermelh') || l.includes('turma a')) return '#EF4444';
+            if (l.includes('verde') || l.includes('turma d')) return '#22C55E';
+            if (l.includes('adm')) return '#10B981';
+            return '#94a3b8';
+        };
+
+        // --- CORE LOGIC ---
+
+        const calculateStatus = (agent, dateStr, team, customSchedules = []) => {
+            const targetDate = parseDate(dateStr);
+            const teamType = team ? team.type : '12x36';
+            
+            // 1. Vacation Check
+            // Moved check to AFTER calculating what the shift WOULD be, to allow mapping to correct slot.
+            const isVacation = agent.vacations?.some(v => targetDate >= parseDate(v.start) && targetDate <= parseDate(v.end));
+
+            // 2. Determine Reference Date & Shift Config
+            const shiftConfig = team?.shifts?.find(s => s.label === agent.fixedShift);
+            const refDateStr = shiftConfig?.refDate || agent.cycleStartDate;
+            
+            if (!refDateStr) return { type: 'OFF' };
+
+            const startDate = parseDate(refDateStr);
+            const diffTime = targetDate - startDate;
+            const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+            let status = { type: 'OFF', shiftType: null, shiftLabel: '', start: '', duration: '', color: '' };
+            const dayOfWeek = targetDate.getDay();
+
+            // Default fallback values
+            const defStart = shiftConfig?.start || '07:00';
+            const defDuration = shiftConfig?.duration || 12;
+            const defColor = shiftConfig?.color || getAutoColor(agent.fixedShift);
+            const defType = shiftConfig?.type || 'DAY';
+
+            // Function to build Work Status
+            const buildWork = (sType = defType, sStart = defStart) => ({
+                type: 'WORK', shiftType: sType, shiftLabel: agent.fixedShift, start: sStart, duration: defDuration, color: defColor
+            });
+
+            // --- Logic Execution ---
+            let calculatedStatus = { type: 'OFF' };
+
+            const customSchedule = customSchedules.find(s => s.id === teamType);
+            if (customSchedule) {
+                let dayConfig = null;
+                if (customSchedule.mode === 'WEEKLY') {
+                    dayConfig = customSchedule.days[dayOfWeek];
+                } else {
+                    const idx = mod(diffDays, customSchedule.days.length);
+                    dayConfig = customSchedule.days[idx];
+                }
+
+                if (dayConfig && dayConfig.status === 'WORK') {
+                    let sType = defType;
+                    let sStart = defStart;
+                    if (dayConfig.override === 'DAY') { sType = 'DAY'; sStart = '07:00'; }
+                    else if (dayConfig.override === 'NIGHT') { sType = 'NIGHT'; sStart = '19:00'; }
+                    calculatedStatus = buildWork(sType, sStart);
+                }
+            }
+            else if (teamType === 'ADM') {
+                if (dayOfWeek >= 1 && dayOfWeek <= 5) calculatedStatus = buildWork('ADM', defStart);
+            }
+            else if (teamType === '4x4') {
+                const cycle = mod(diffDays, 8);
+                if (cycle === 0 || cycle === 1) calculatedStatus = buildWork('DAY', '07:00');
+                else if (cycle === 2 || cycle === 3) calculatedStatus = buildWork('NIGHT', '19:00');
+            }
+            else if (teamType === '2x2') {
+                const cycle = mod(diffDays, 4);
+                if (cycle === 0 || cycle === 1) calculatedStatus = buildWork(defType, defStart);
+            }
+            else if (teamType === '12x36') {
+                const cycle = mod(diffDays, 2);
+                if (cycle === 0) calculatedStatus = buildWork(defType, defStart);
+            }
+
+            // Apply Vacation Override AFTER calculation
+            if (isVacation) {
+                return { 
+                    ...calculatedStatus, // Keep shift info (start, type, etc) for UI placement
+                    type: 'VACATION', 
+                    originalStatus: calculatedStatus.type // To know if they missed a work day or just a day off
+                };
+            }
+
+            return calculatedStatus;
+        };
+
+        // --- Components ---
+
+        const App = () => {
+            const [view, setView] = useState('dashboard');
+            const [teams, setTeams] = useState([]);
+            const [agents, setAgents] = useState([]);
+            const [customSchedules, setCustomSchedules] = useState([]);
+            const [currentDate, setCurrentDate] = useState(formatDate(new Date()));
+            const [dashboardMode, setDashboardMode] = useState('daily');
+
+            useEffect(() => {
+                const ls = localStorage;
+                if (ls.getItem('escala_teams')) {
+                    try {
+                        setTeams(JSON.parse(ls.getItem('escala_teams')));
+                        setAgents(JSON.parse(ls.getItem('escala_agents')));
+                        setCustomSchedules(JSON.parse(ls.getItem('escala_custom_schedules') || '[]'));
+                    } catch(e) { console.error("Data error", e); }
+                } else {
+                    seedData();
+                }
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem('escala_teams', JSON.stringify(teams));
+                localStorage.setItem('escala_agents', JSON.stringify(agents));
+                localStorage.setItem('escala_custom_schedules', JSON.stringify(customSchedules));
+            }, [teams, agents, customSchedules]);
+
+            const seedData = () => {
+                const t1 = uuid(); 
+                const tVale = uuid();
+                const today = formatDate(new Date());
+                const yesterday = formatDate(addDays(new Date(), -1));
+
+                const initialTeams = [
+                    { 
+                        id: t1, name: 'Portaria Central', type: '12x36', location: 'SP', icon: 'ph-buildings',
+                        shifts: [
+                            { label: 'Diurno', type: 'DAY', start: '07:00', duration: 12, color: getAutoColor('Diurno') },
+                            { label: 'Noturno', type: 'NIGHT', start: '19:00', duration: 12, color: getAutoColor('Noturno') }
+                        ]
+                    },
+                    {
+                        id: tVale, name: 'Vale Brucutu', type: '2x2', location: 'Mineração', icon: 'ph-truck',
+                        shifts: [
+                            { label: 'M1', type: 'DAY', start: '07:00', duration: 12, color: getAutoColor('M1'), refDate: today },
+                            { label: 'M2', type: 'DAY', start: '07:00', duration: 12, color: getAutoColor('M2'), refDate: yesterday },
+                            { label: 'T1', type: 'NIGHT', start: '19:00', duration: 12, color: getAutoColor('T1'), refDate: today },
+                            { label: 'T2', type: 'NIGHT', start: '19:00', duration: 12, color: getAutoColor('T2'), refDate: yesterday }
+                        ]
+                    }
+                ];
+
+                const initialAgents = [
+                    { id: uuid(), name: 'Carlos Silva', teamIds: [t1], role: 'AGENT', fixedShift: 'Diurno', cycleStartDate: today, isContact: true, phone: '(11) 99999-0000' },
+                    { id: uuid(), name: 'Ana Souza', teamIds: [t1], role: 'AGENT', fixedShift: 'Noturno', cycleStartDate: today },
+                    // Vale Brucutu - 2 per shift
+                    { id: uuid(), name: 'Op. M1 (João)', teamIds: [tVale], role: 'AGENT', fixedShift: 'M1', cycleStartDate: today },
+                    { id: uuid(), name: 'Op. M1 (Maria)', teamIds: [tVale], role: 'AGENT', fixedShift: 'M1', cycleStartDate: today },
+                    { id: uuid(), name: 'Op. T1 (Pedro)', teamIds: [tVale], role: 'AGENT', fixedShift: 'T1', cycleStartDate: today },
+                    { id: uuid(), name: 'Op. T1 (Julia)', teamIds: [tVale], role: 'AGENT', fixedShift: 'T1', cycleStartDate: today },
+                    // Ferista covering Vale
+                    { id: uuid(), name: 'Roberto Ferista', teamIds: [tVale, t1], role: 'FERISTA', fixedShift: 'ANY', cycleStartDate: today }
+                ];
+
+                setTeams(initialTeams);
+                setAgents(initialAgents);
+            };
+
+            // CRUD Wrappers
+            const updateTeam = (t) => setTeams(prev => prev.map(x => x.id === t.id ? t : x));
+            const addTeam = (t) => setTeams(prev => [...prev, { ...t, id: uuid() }]);
+            const delTeam = (id) => setTeams(prev => prev.filter(x => x.id !== id));
+            
+            const updateAgent = (a) => setAgents(prev => prev.map(x => x.id === a.id ? a : x));
+            const addAgent = (a) => setAgents(prev => [...prev, { ...a, id: uuid() }]);
+            const delAgent = (id) => setAgents(prev => prev.filter(x => x.id !== id));
+
+            return (
+                <div className="min-h-screen pb-10">
+                    <header className="bg-slate-900 text-white shadow-lg sticky top-0 z-50">
+                        <div className="max-w-[1920px] mx-auto px-6 py-4 flex flex-col md:flex-row gap-4 justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="p-2 bg-blue-600 rounded-lg"><i className="ph ph-calendar-check text-2xl"></i></div>
+                                <div><h1 className="text-xl font-bold leading-none">Escala<span className="text-blue-400">Pro</span></h1></div>
+                            </div>
+                            <nav className="flex gap-2 bg-slate-800 p-1 rounded-xl">
+                                <NavBtn id="dashboard" icon={<IconCalendar/>} label="Painel" view={view} setView={setView}/>
+                                <NavBtn id="teams" icon={<IconUsers/>} label="Equipes" view={view} setView={setView}/>
+                                <NavBtn id="schedules" icon={<IconList/>} label="Modelos" view={view} setView={setView}/>
+                                <NavBtn id="agents" icon={<IconUser/>} label="Agentes" view={view} setView={setView}/>
+                                <NavBtn id="settings" icon={<IconSettings/>} label="Config" view={view} setView={setView}/>
+                            </nav>
+                        </div>
+                    </header>
+                    <main className="max-w-[1920px] mx-auto px-6 py-6">
+                        {view === 'dashboard' && <Dashboard teams={teams} agents={agents} customSchedules={customSchedules} currentDate={currentDate} setCurrentDate={setCurrentDate} mode={dashboardMode} setMode={setDashboardMode} />}
+                        {view === 'teams' && <TeamManager teams={teams} customSchedules={customSchedules} onAdd={addTeam} onUpdate={updateTeam} onDelete={delTeam} />}
+                        {view === 'schedules' && <ScheduleManager schedules={customSchedules} setSchedules={setCustomSchedules} />}
+                        {view === 'agents' && <AgentManager agents={agents} teams={teams} onAdd={addAgent} onUpdate={updateAgent} onDelete={delAgent} />}
+                        {view === 'settings' && <Settings teams={teams} agents={agents} setTeams={setTeams} setAgents={setAgents} />}
+                    </main>
+                </div>
+            );
+        };
+
+        const NavBtn = ({ id, icon, label, view, setView }) => (
+            <button onClick={() => setView(id)} className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${view === id ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}>{icon} <span className="hidden sm:inline">{label}</span></button>
+        );
+
+        // --- DASHBOARD ---
+
+        const Dashboard = ({ teams, agents, customSchedules, currentDate, setCurrentDate, mode, setMode }) => {
+            const handlePrev = () => setCurrentDate(formatDate(addDays(new Date(currentDate), mode === 'weekly' ? -7 : -1)));
+            const handleNext = () => setCurrentDate(formatDate(addDays(new Date(currentDate), mode === 'weekly' ? 7 : 1)));
+            const handleToday = () => setCurrentDate(formatDate(new Date()));
+
+            // Logic to find coverage
+            const getWorkersForShift = (team, shiftType, dateStr) => {
+                let roaster = [];
+                const teamAgents = agents.filter(a => a.teamIds?.includes(team.id));
+
+                teamAgents.forEach(agent => {
+                    const status = calculateStatus(agent, dateStr, team, customSchedules);
+                    
+                    // Filter Logic:
+                    // 1. Is Work? Match shift type
+                    // 2. Is Vacation? Match shift type (to show placeholder or coverage)
+                    
+                    // Match shift type. ROTATING (4x4) is valid if status is DAY or NIGHT.
+                    let isShiftMatch = false;
+                    if (shiftType === 'ADM') isShiftMatch = status.shiftType === 'ADM';
+                    else if (shiftType === 'ROTATING') isShiftMatch = (status.shiftType === 'DAY' || status.shiftType === 'NIGHT');
+                    else isShiftMatch = status.shiftType === shiftType;
+                    
+                    if (isShiftMatch) {
+                        if (status.type === 'WORK') {
+                            roaster.push({...agent, status: 'NORMAL', ...status});
+                        } else if (status.type === 'VACATION' && status.originalStatus === 'WORK') {
+                            // Only add to roaster if they missed a WORK day
+                            roaster.push({...agent, status: 'VACATION', ...status});
+                        }
+                    }
+                });
+
+                // Resolve Substitutions (Feristas)
+                return roaster.map(w => {
+                    if (w.status === 'VACATION') {
+                        const cover = agents.find(f => {
+                            if (f.role !== 'FERISTA') return false;
+                            if (!f.teamIds?.includes(team.id)) return false; 
+                            const fStatus = calculateStatus(f, dateStr, null, customSchedules);
+                            return fStatus.type !== 'VACATION' && fStatus.type !== 'WORK';
+                        });
+
+                        if (cover) {
+                            return { ...cover, isCover: true, coveringFor: w.name, shiftLabel: `Cob. ${w.shiftLabel}`, start: w.start, duration: w.duration, color: w.color };
+                        }
+                        return { ...w, unassigned: true };
+                    }
+                    return w;
+                });
+            };
+
+            return (
+                <div className="space-y-6">
+                    <div className="flex flex-col md:flex-row justify-between items-center bg-white p-3 rounded-2xl shadow-sm border">
+                        <div className="bg-slate-100 p-1 rounded-xl flex gap-1">
+                            {['daily', 'weekly'].map(m => (
+                                <button key={m} onClick={() => setMode(m)} className={`px-6 py-2 rounded-lg text-sm font-bold capitalize ${mode === m ? 'bg-white text-blue-600 shadow' : 'text-slate-500'}`}>{m === 'daily' ? 'Diário' : 'Semanal (TV)'}</button>
+                            ))}
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <button onClick={handlePrev} className="p-2 hover:bg-slate-100 rounded-full"><i className="ph ph-caret-left text-xl"></i></button>
+                            <div className="text-center">
+                                <div className="text-lg font-bold text-slate-800">{new Date(currentDate+'T00:00').toLocaleDateString('pt-BR')}</div>
+                                <div className="text-xs text-slate-500 uppercase font-bold">{getDayName(currentDate)}</div>
+                            </div>
+                            <button onClick={handleNext} className="p-2 hover:bg-slate-100 rounded-full"><i className="ph ph-caret-right text-xl"></i></button>
+                            <button onClick={handleToday} className="text-sm font-bold text-blue-600 hover:bg-blue-50 px-3 py-1 rounded">Hoje</button>
+                        </div>
+                    </div>
+
+                    {mode === 'daily' ? (
+                        <div className="grid gap-6">
+                            {teams.map(team => {
+                                const yesterday = formatDate(addDays(new Date(currentDate), -1));
+                                const tomorrow = formatDate(addDays(new Date(currentDate), 1));
+                                return (
+                                    <div key={team.id} className="bg-white rounded-2xl shadow-sm border overflow-hidden">
+                                        <div className="bg-slate-50 px-6 py-3 border-b flex justify-between items-center">
+                                            <h3 className="font-bold flex items-center gap-2"><DynamicIcon name={team.icon || 'ph-buildings'} className="text-lg text-slate-500"/> {team.name}</h3>
+                                            <span className="text-xs bg-white px-2 py-1 rounded border font-medium">{team.type}</span>
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-4 divide-y md:divide-y-0 md:divide-x">
+                                            {team.type === 'ADM' ? (
+                                                <ShiftCard title="Expediente" workers={getWorkersForShift(team, 'ADM', currentDate)} isActive={isShiftActiveNow(currentDate, '08:00', 9)} />
+                                            ) : (
+                                                <>
+                                                    <ShiftCard title="Entregou (Ontem)" workers={getWorkersForShift(team, 'NIGHT', yesterday)} />
+                                                    <ShiftCard title="Dia (Hoje)" workers={getWorkersForShift(team, 'DAY', currentDate)} isActive={isShiftActiveNow(currentDate, '07:00', 12)} />
+                                                    <ShiftCard title="Noite (Hoje)" workers={getWorkersForShift(team, 'NIGHT', currentDate)} isActive={isShiftActiveNow(currentDate, '19:00', 12)} />
+                                                    <ShiftCard title="Assume (Amanhã)" workers={getWorkersForShift(team, 'DAY', tomorrow)} />
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                    ) : (
+                        <div className="space-y-8">
+                            {teams.map(team => {
+                                const days = Array.from({length: 7}, (_, i) => {
+                                    const d = addDays(new Date(currentDate), i);
+                                    return { str: formatDate(d), obj: d };
+                                });
+                                return (
+                                    <div key={team.id} className="bg-white rounded-3xl shadow-lg border overflow-hidden">
+                                        <div className="bg-slate-900 text-white px-6 py-4 flex justify-between items-center">
+                                            <div className="flex items-center gap-3">
+                                                <div className="p-2 bg-white/10 rounded-xl"><DynamicIcon name={team.icon} className="text-2xl"/></div>
+                                                <h3 className="text-xl font-bold">{team.name}</h3>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                {team.shifts?.map((s,i) => <span key={i} className="text-xs bg-slate-800 px-2 py-1 rounded border border-slate-700" style={{color: s.color}}>{s.label}</span>)}
+                                            </div>
+                                        </div>
+                                        <div className="grid grid-cols-7 divide-x bg-slate-50 border-b">
+                                            {days.map(d => {
+                                                const isToday = d.str === formatDate(new Date());
+                                                return (
+                                                    <div key={d.str} className={`p-3 text-center ${isToday ? 'bg-blue-50' : ''}`}>
+                                                        <div className={`text-xs font-bold ${isToday?'text-blue-600':'text-slate-400'}`}>{getDayName(d.str).substr(0,3).toUpperCase()}</div>
+                                                        <div className={`text-xl font-black ${isToday?'text-blue-700':'text-slate-700'}`}>{d.obj.getDate()}</div>
+                                                    </div>
+                                                )
+                                            })}
+                                        </div>
+                                        <div className="grid grid-cols-7 divide-x">
+                                            {days.map(d => (
+                                                <div key={d.str} className="p-2 min-h-[150px] space-y-2">
+                                                    {team.shifts?.map((shift, idx) => {
+                                                        // Filter Logic adapted for Weekly View
+                                                        const workers = getWorkersForShift(team, shift.type, d.str).filter(w => w.shiftLabel.includes(shift.label) || (shift.type === 'ADM' && w.shiftLabel.includes('ADM')));
+                                                        if(workers.length === 0) return null;
+                                                        
+                                                        const isActive = isShiftActiveNow(d.str, shift.start, shift.duration);
+                                                        
+                                                        return (
+                                                            <div key={idx} className={`rounded-xl p-2 border ${isActive ? 'ring-2 ring-green-400 bg-green-50/50 border-green-200' : 'bg-white border-slate-100'}`}>
+                                                                <div className="flex justify-between items-center mb-1">
+                                                                    <div className="flex items-center gap-1">
+                                                                        <span className="w-1.5 h-1.5 rounded-full" style={{backgroundColor: shift.color}}></span>
+                                                                        <span className="text-[9px] font-bold text-slate-500 uppercase">{shift.label}</span>
+                                                                    </div>
+                                                                    {isActive && <span className="flex h-1.5 w-1.5 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500"></span></span>}
+                                                                </div>
+                                                                <div className="space-y-1">
+                                                                    {workers.map((w, i) => <WorkerRow key={i} w={w} />)}
+                                                                </div>
+                                                            </div>
+                                                        )
+                                                    })}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const ShiftCard = ({ title, workers, isActive }) => {
+            return (
+                <div className={`p-4 flex flex-col h-full w-full transition-all duration-300 ${isActive ? 'bg-green-50/50 ring-2 ring-inset ring-green-400' : ''}`}>
+                    <div className="flex justify-between items-center mb-3">
+                        <h4 className={`text-xs font-bold uppercase tracking-wider ${isActive ? 'text-green-700' : 'text-slate-400'}`}>{title}</h4>
+                        {isActive && <span className="flex h-2 w-2 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span></span>}
+                    </div>
+                    <div className="flex-1 space-y-2">
+                        {workers.length === 0 ? <span className="text-xs text-slate-300 italic">Sem escala</span> : workers.map((w, i) => (
+                            <div key={i} className={`p-2 rounded-lg border flex items-center gap-3 ${w.unassigned ? 'bg-red-50 border-red-100' : (w.isCover ? 'bg-orange-50 border-orange-100' : 'bg-white border-slate-100')}`}>
+                                <Avatar w={w} />
+                                <div className="flex-1 min-w-0">
+                                    <div className="font-bold text-sm text-slate-800 truncate">{w.name}</div>
+                                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                                        <span className="flex items-center gap-1"><IconClock size={12}/> {w.start}</span>
+                                        {w.isContact && <span className="flex items-center gap-1 text-blue-600 font-bold bg-blue-50 px-1.5 rounded"><IconPhone size={10}/> {w.phone}</span>}
+                                    </div>
+                                    {w.isCover && <div className="text-[10px] text-orange-600 font-medium">Cob. {w.coveringFor}</div>}
+                                    {w.unassigned && <div className="text-[10px] text-red-600 font-bold flex items-center gap-1"><IconWarning/> FÉRIAS S/ COB</div>}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+        };
+
+        const WorkerRow = ({ w }) => (
+            <div className="flex items-center gap-2 overflow-hidden">
+                <Avatar w={w} size="sm" />
+                <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold text-slate-700 truncate">{w.name}</div>
+                    {w.isContact && <div className="text-[9px] text-blue-600 font-medium flex items-center gap-0.5"><IconPhone size={8}/> {w.phone}</div>}
+                    {w.isCover && <div className="text-[9px] text-orange-500 truncate">Cob. {w.coveringFor}</div>}
+                </div>
+            </div>
+        );
+
+        const Avatar = ({ w, size }) => {
+            const dims = size === 'sm' ? 'w-6 h-6 text-xs' : 'w-9 h-9 text-sm';
+            return w.photoUrl ? 
+                <img src={w.photoUrl} className={`${dims} rounded-full object-cover border border-slate-200`} /> :
+                <div className={`${dims} rounded-full flex items-center justify-center bg-slate-100 text-slate-400 font-bold`}>{w.name.charAt(0)}</div>
+        };
+
+        // --- MANAGERS ---
+
+        const AgentManager = ({ agents, teams, onAdd, onUpdate, onDelete }) => {
+            const [editingAgent, setEditingAgent] = useState(null);
+            const [formData, setFormData] = useState({
+                name: '', photoUrl: '', role: 'AGENT', isContact: false, phone: '',
+                teamIds: [], fixedShift: '', cycleStartDate: formatDate(new Date())
+            });
+            const [searchTerm, setSearchTerm] = useState('');
+
+            // Load agent into form
+            useEffect(() => {
+                if (editingAgent) {
+                    setFormData({
+                        name: editingAgent.name || '',
+                        photoUrl: editingAgent.photoUrl || '',
+                        role: editingAgent.role || 'AGENT',
+                        isContact: editingAgent.isContact || false,
+                        phone: editingAgent.phone || '',
+                        teamIds: editingAgent.teamIds || [],
+                        fixedShift: editingAgent.fixedShift || '',
+                        cycleStartDate: editingAgent.cycleStartDate || formatDate(new Date())
+                    });
+                } else {
+                    resetFormState();
+                }
+            }, [editingAgent]);
+
+            const resetFormState = () => {
+                setFormData({
+                    name: '', photoUrl: '', role: 'AGENT', isContact: false, phone: '',
+                    teamIds: [], fixedShift: '', cycleStartDate: formatDate(new Date())
+                });
+            };
+
+            const handleInputChange = (e) => {
+                const { name, value, type, checked } = e.target;
+                setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
+            };
+
+            const handleTeamToggle = (teamId) => {
+                setFormData(prev => {
+                    let newTeams;
+                    if (prev.role === 'FERISTA') {
+                        newTeams = prev.teamIds.includes(teamId) ? prev.teamIds.filter(id => id !== teamId) : [...prev.teamIds, teamId];
+                    } else {
+                        newTeams = [teamId];
+                    }
+                    return { ...prev, teamIds: newTeams, fixedShift: '' }; // Reset shift on team change
+                });
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!formData.name) return alert('Nome é obrigatório');
+                if (formData.teamIds.length === 0 && formData.role !== 'FERISTA') return alert('Selecione uma equipe');
+
+                const payload = {
+                    ...formData,
+                    vacations: editingAgent ? editingAgent.vacations : []
+                };
+
+                if (editingAgent) {
+                    onUpdate({ ...payload, id: editingAgent.id });
+                    setEditingAgent(null);
+                } else {
+                    onAdd(payload);
+                    resetFormState();
+                }
+            };
+
+            // Derived
+            const primaryTeamId = formData.teamIds[0];
+            const primaryTeam = teams.find(t => t.id === primaryTeamId);
+            const availableShifts = primaryTeam?.shifts || [];
+            
+            const selectedShiftConfig = availableShifts.find(s => s.label === formData.fixedShift);
+            const hasRefDate = !!selectedShiftConfig?.refDate;
+
+            return (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="lg:col-span-1 bg-white p-6 rounded-xl shadow-sm border sticky top-24">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="font-bold text-slate-800">{editingAgent ? 'Editar' : 'Novo Colaborador'}</h2>
+                            {editingAgent && <button onClick={() => setEditingAgent(null)} className="text-xs text-red-500 hover:underline">Cancelar</button>}
+                        </div>
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div><label className="text-xs font-bold text-slate-500 uppercase">Nome</label><input name="name" value={formData.name} onChange={handleInputChange} required className="w-full border rounded p-2 text-sm"/></div>
+                            <div><label className="text-xs font-bold text-slate-500 uppercase">Foto (URL)</label><input name="photoUrl" value={formData.photoUrl} onChange={handleInputChange} className="w-full border rounded p-2 text-sm" placeholder="https://..."/></div>
+                            
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="text-xs font-bold text-slate-500 uppercase">Função</label>
+                                    <select name="role" value={formData.role} onChange={handleInputChange} className="w-full border rounded p-2 text-sm">
+                                        <option value="AGENT">Operador</option>
+                                        <option value="N2">N2 (Líder)</option>
+                                        <option value="FERISTA">Ferista</option>
+                                    </select>
+                                </div>
+                                <div className="flex items-center gap-2 mt-4">
+                                    <input type="checkbox" name="isContact" checked={formData.isContact} id="isContact" onChange={handleInputChange} />
+                                    <label htmlFor="isContact" className="text-sm font-medium">É Contato?</label>
+                                </div>
+                            </div>
+                            
+                            {formData.isContact && (
+                                <div>
+                                    <label className="text-xs font-bold text-slate-500 uppercase">Telefone / Ramal</label>
+                                    <input name="phone" value={formData.phone} onChange={handleInputChange} className="w-full border rounded p-2 text-sm" placeholder="(00) 00000-0000"/>
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="text-xs font-bold text-slate-500 uppercase">Equipe(s)</label>
+                                <div className="max-h-32 overflow-y-auto border rounded p-2 bg-slate-50 space-y-1">
+                                    {teams.map(t => (
+                                        <div key={t.id} onClick={()=>handleTeamToggle(t.id)} className={`cursor-pointer text-xs p-2 rounded flex items-center gap-2 ${formData.teamIds.includes(t.id) ? 'bg-blue-600 text-white' : 'hover:bg-slate-200'}`}>
+                                            <div className={`w-3 h-3 rounded-full border ${formData.teamIds.includes(t.id) ? 'bg-white' : 'bg-slate-300'}`}></div>
+                                            {t.name}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="text-xs font-bold text-slate-500 uppercase">Turno / Turma</label>
+                                <select name="fixedShift" value={formData.fixedShift} onChange={handleInputChange} className="w-full border rounded p-2 text-sm">
+                                    <option value="">Selecione...</option>
+                                    {availableShifts.map((s,i) => <option key={i} value={s.label}>{s.label} ({s.start}) {s.refDate ? '🔒' : ''}</option>)}
+                                    <option value="ANY">Flexível (Ferista)</option>
+                                </select>
+                            </div>
+
+                            <div className={`p-3 rounded border ${hasRefDate ? 'bg-green-50 border-green-200' : 'bg-slate-50'}`}>
+                                <label className="text-xs font-bold text-slate-500 uppercase">Início do Ciclo</label>
+                                {hasRefDate ? (
+                                    <div className="text-xs text-green-700 font-medium flex items-center gap-2 mt-1">
+                                        <i className="ph ph-lock-key"></i> Gerenciado pela Equipe
+                                        {/* Hidden input to ensure refDate is used if needed, though calculation handles it */}
+                                    </div>
+                                ) : (
+                                    <input type="date" name="cycleStartDate" value={formData.cycleStartDate} onChange={handleInputChange} className="w-full border rounded p-1 text-sm mt-1"/>
+                                )}
+                            </div>
+
+                            <div className="flex gap-2 pt-2">
+                                <button type="button" onClick={() => setEditingAgent(null)} className="flex-1 border rounded p-2 text-sm hover:bg-slate-50">Limpar</button>
+                                <button type="submit" className="flex-1 bg-blue-600 text-white rounded p-2 text-sm font-bold hover:bg-blue-700">
+                                    {editingAgent ? 'Atualizar' : 'Cadastrar'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+
+                    <div className="lg:col-span-2 space-y-4">
+                        <div className="flex gap-2 bg-white p-2 rounded-xl border">
+                            <input className="flex-1 outline-none px-2 text-sm" placeholder="Buscar..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)}/>
+                            <button onClick={() => setEditingAgent(null)} className="text-blue-600 font-bold text-sm px-3"><IconPlus/> Novo</button>
+                        </div>
+                        {/* Agent List Logic Simplified */}
+                        {teams.map(t => {
+                            const teamAgents = agents.filter(a => a.teamIds?.includes(t.id) && a.role !== 'FERISTA' && a.name.toLowerCase().includes(searchTerm.toLowerCase()));
+                            if(teamAgents.length === 0) return null;
+                            return (
+                                <div key={t.id} className="bg-white rounded-xl border overflow-hidden">
+                                    <div className="bg-slate-50 px-4 py-2 border-b text-xs font-bold uppercase text-slate-500">{t.name}</div>
+                                    <div className="divide-y">
+                                        {teamAgents.map(a => <AgentListItem key={a.id} agent={a} onEdit={setEditingAgent} onDelete={onDelete} />)}
+                                    </div>
+                                </div>
+                            )
+                        })}
+                        {/* Feristas */}
+                        <div className="bg-white rounded-xl border overflow-hidden border-orange-200">
+                            <div className="bg-orange-50 px-4 py-2 border-b border-orange-100 text-xs font-bold uppercase text-orange-600">Feristas</div>
+                            <div className="divide-y">
+                                {agents.filter(a => a.role === 'FERISTA').map(a => <AgentListItem key={a.id} agent={a} onEdit={setEditingAgent} onDelete={onDelete} />)}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const AgentListItem = ({ agent, onEdit, onDelete }) => (
+            <div className="p-3 flex justify-between items-center hover:bg-slate-50">
+                <div className="flex items-center gap-3">
+                    <Avatar w={agent} />
+                    <div>
+                        <div className="font-bold text-sm text-slate-800 flex items-center gap-2">
+                            {agent.name}
+                            {agent.isContact && <i className="ph ph-phone text-blue-500" title={agent.phone}></i>}
+                        </div>
+                        <div className="text-xs text-slate-500">{agent.fixedShift}</div>
+                    </div>
+                </div>
+                <div className="flex gap-2">
+                    <button onClick={()=>onEdit(agent)} className="text-blue-600 hover:bg-blue-50 p-1.5 rounded"><IconEdit/></button>
+                    <button onClick={()=>onDelete(agent.id)} className="text-red-500 hover:bg-red-50 p-1.5 rounded"><IconTrash/></button>
+                </div>
+            </div>
+        );
+
+        // --- Placeholders for other components to save space but they must exist ---
+        const TeamManager = ({ teams, customSchedules, onAdd, onUpdate, onDelete }) => {
+            const [editing, setEditing] = useState(null);
+            const [shifts, setShifts] = useState([]);
+            useEffect(() => {
+                if(editing) setShifts(editing.shifts || []);
+                else setShifts([{label:'Diurno', type:'DAY', start:'07:00', duration:12, color:'#F59E0B'}, {label:'Noturno', type:'NIGHT', start:'19:00', duration:12, color:'#1E3A8A'}]);
+            }, [editing]);
+
+            const save = (e) => {
+                e.preventDefault();
+                const d = { name: e.target.name.value, type: e.target.type.value, location: e.target.location.value, icon: 'ph-buildings', shifts };
+                if(editing) { onUpdate({...editing, ...d}); setEditing(null); } else onAdd(d);
+                e.target.reset();
+            };
+
+            const updateS = (i, f, v) => {
+                const n = [...shifts]; n[i][f] = v;
+                if(f === 'label') n[i].color = getAutoColor(v);
+                setShifts(n);
+            };
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="bg-white p-6 rounded-xl border">
+                        <form onSubmit={save} className="space-y-4">
+                            <input name="name" defaultValue={editing?.name} placeholder="Nome da Equipe" className="w-full border rounded p-2" required />
+                            <select name="type" defaultValue={editing?.type} className="w-full border rounded p-2">
+                                <option value="12x36">12x36</option><option value="4x4">4x4</option><option value="2x2">2x2</option><option value="ADM">ADM</option>
+                                {customSchedules.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                            </select>
+                            <input name="location" defaultValue={editing?.location} placeholder="Local" className="w-full border rounded p-2" />
+                            
+                            <div className="border-t pt-2">
+                                <label className="text-xs font-bold text-slate-500">Turnos</label>
+                                {shifts.map((s, i) => (
+                                    <div key={i} className="flex flex-col gap-2 p-2 border rounded mt-2 text-sm bg-slate-50">
+                                        <div className="flex gap-2">
+                                            <input type="color" value={s.color} onChange={e=>updateS(i,'color',e.target.value)} className="w-8 h-8 rounded cursor-pointer"/>
+                                            <input value={s.label} onChange={e=>updateS(i,'label',e.target.value)} placeholder="Nome" className="flex-1 border rounded p-1"/>
+                                            <select value={s.type} onChange={e=>updateS(i,'type',e.target.value)} className="border rounded"><option value="DAY">Dia</option><option value="NIGHT">Noite</option><option value="ADM">ADM</option><option value="ROTATING">Rotativo</option></select>
+                                        </div>
+                                        <div className="flex gap-2 items-center">
+                                            <input type="time" value={s.start} onChange={e=>updateS(i,'start',e.target.value)} className="border rounded p-1"/>
+                                            <input type="number" value={s.duration} onChange={e=>updateS(i,'duration',e.target.value)} className="border rounded p-1 w-16" placeholder="Hs"/>
+                                            <div className="flex-1 border-l pl-2">
+                                                <span className="text-[10px] text-slate-500 block">Data Base (Início Ciclo)</span>
+                                                <input type="date" value={s.refDate || ''} onChange={e=>updateS(i,'refDate',e.target.value)} className="w-full bg-transparent text-xs"/>
+                                            </div>
+                                            <button type="button" onClick={()=>setShifts(shifts.filter((_,x)=>x!==i))} className="text-red-500"><IconX/></button>
+                                        </div>
+                                    </div>
+                                ))}
+                                <button type="button" onClick={()=>setShifts([...shifts, {label:'Novo', type:'DAY', start:'07:00', duration:12, color:'#ccc'}])} className="text-xs text-blue-600 mt-2 font-bold">+ Adicionar Turno</button>
+                            </div>
+                            <div className="flex gap-2"><button type="button" onClick={()=>setEditing(null)} className="flex-1 border p-2 rounded">Cancelar</button><button className="flex-1 bg-blue-600 text-white p-2 rounded">Salvar</button></div>
+                        </form>
+                    </div>
+                    <div className="space-y-2">
+                        {teams.map(t => (
+                            <div key={t.id} className="bg-white p-3 rounded-lg border flex justify-between items-center">
+                                <div><div className="font-bold">{t.name}</div><div className="text-xs text-slate-500">{t.type}</div></div>
+                                <div className="flex gap-2"><button onClick={()=>setEditing(t)} className="text-blue-500"><IconEdit/></button><button onClick={()=>onDelete(t.id)} className="text-red-500"><IconTrash/></button></div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )
+        };
+
+        const ScheduleManager = ({ schedules, setSchedules }) => {
+            const [editing, setEditing] = useState(null);
+            const createNew = () => ({ id: uuid(), name: 'Nova Escala', mode: 'CYCLIC', cycleLength: 3, days: Array(3).fill({status:'WORK', override:null}) });
+            
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="bg-white p-6 rounded-xl border">
+                        <h2 className="font-bold mb-4">{editing ? 'Editar' : 'Modelos'}</h2>
+                        {!editing ? <button onClick={()=>setEditing(createNew())} className="bg-blue-600 text-white px-4 py-2 rounded w-full">Criar Novo</button> : (
+                            <div className="space-y-4">
+                                <input value={editing.name} onChange={e=>setEditing({...editing, name: e.target.value})} className="w-full border rounded p-2"/>
+                                <select value={editing.mode} onChange={e=>setEditing({...editing, mode:e.target.value})} className="w-full border rounded p-2"><option value="CYCLIC">Ciclo</option><option value="WEEKLY">Semanal</option></select>
+                                {editing.mode==='CYCLIC' && <input type="number" value={editing.cycleLength} onChange={e=>{
+                                    const len = parseInt(e.target.value);
+                                    const days = [...editing.days];
+                                    while(days.length < len) days.push({status:'OFF', override:null});
+                                    setEditing({...editing, cycleLength: len, days: days.slice(0, len)});
+                                }} className="w-full border rounded p-2"/>}
+                                <div className="grid grid-cols-4 gap-2">
+                                    {editing.days.map((d,i) => (
+                                        <button key={i} type="button" onClick={()=>{
+                                            const n = [...editing.days];
+                                            const next = d.status==='WORK'?(d.override===null?'DAY':(d.override==='DAY'?'NIGHT':'OFF')):'WORK';
+                                            n[i] = { status: next==='OFF'?'OFF':'WORK', override: next==='OFF'||next==='WORK'?null:next };
+                                            setEditing({...editing, days: n});
+                                        }} className={`p-2 text-xs font-bold border rounded ${d.status==='OFF'?'bg-slate-100':'bg-blue-100 text-blue-700'}`}>
+                                            {i+1}: {d.status==='OFF'?'FOLGA':(d.override || 'TURNO')}
+                                        </button>
+                                    ))}
+                                </div>
+                                <div className="flex gap-2"><button onClick={()=>setEditing(null)} className="flex-1 border p-2 rounded">Cancelar</button><button onClick={()=>{
+                                    const exists = schedules.find(s=>s.id===editing.id);
+                                    setSchedules(exists ? schedules.map(s=>s.id===editing.id?editing:s) : [...schedules, editing]);
+                                    setEditing(null);
+                                }} className="flex-1 bg-green-600 text-white p-2 rounded">Salvar</button></div>
+                            </div>
+                        )}
+                    </div>
+                    <div className="space-y-2">
+                        {schedules.map(s => (
+                            <div key={s.id} className="bg-white p-3 rounded-lg border flex justify-between">
+                                <span className="font-bold">{s.name}</span>
+                                <button onClick={()=>setSchedules(schedules.filter(x=>x.id!==s.id))} className="text-red-500"><IconTrash/></button>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )
+        };
+
+        const Settings = ({ teams, agents, customSchedules, setTeams, setAgents, setCustomSchedules }) => (
+            <div className="bg-white p-6 rounded-xl border">
+                <h2 className="font-bold mb-4">Backup e Dados</h2>
+                <div className="flex gap-4">
+                    <button onClick={() => {
+                        const blob = new Blob([JSON.stringify({teams, agents, customSchedules})], {type: 'application/json'});
+                        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'backup.json'; a.click();
+                    }} className="flex items-center gap-2 bg-blue-50 text-blue-700 px-4 py-2 rounded-lg border border-blue-100 hover:bg-blue-100"><IconDownload/> Baixar Dados</button>
+                    
+                    <label className="flex items-center gap-2 bg-slate-50 text-slate-700 px-4 py-2 rounded-lg border border-slate-200 hover:bg-slate-100 cursor-pointer">
+                        <IconUpload/> Restaurar
+                        <input type="file" className="hidden" accept=".json" onChange={(e) => {
+                            const r = new FileReader();
+                            r.onload = (ev) => {
+                                const d = JSON.parse(ev.target.result);
+                                if(d.teams && d.agents) { 
+                                    setTeams(d.teams); 
+                                    setAgents(d.agents); 
+                                    if (d.customSchedules) setCustomSchedules(d.customSchedules);
+                                    alert('Restaurado!'); 
+                                }
+                            };
+                            if(e.target.files[0]) r.readAsText(e.target.files[0]);
+                        }}/>
+                    </label>
+
+                    <button onClick={() => { if(confirm('Apagar tudo?')) { localStorage.clear(); window.location.reload(); } }} className="ml-auto text-red-500 text-sm hover:underline">Resetar Fábrica</button>
+                </div>
+            </div>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
